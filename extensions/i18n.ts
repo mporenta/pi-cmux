@@ -1,10 +1,10 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Locale = "es" | "fr" | "pt-BR";
-type Key = keyof typeof fallback;
 type Params = Record<string, string | number>;
 
 const namespace = "pi-cmux";
+const localeChangedEvent = `${namespace}/i18n/localeChanged`;
 
 const fallback = {
 	"open.usage": "Usage: /{name} <command...>",
@@ -16,7 +16,9 @@ const fallback = {
 	"open.success.down": "Opened a tool split below",
 } as const;
 
-const translations: Record<Locale, Partial<Record<Key, string>>> = {
+export type I18nKey = keyof typeof fallback;
+
+const translations: Record<Locale, Partial<Record<I18nKey, string>>> = {
 	es: {
 		"open.usage": "Uso: /{name} <comando...>",
 		"open.failed": "falló la división de herramienta: {error}",
@@ -52,10 +54,39 @@ function format(template: string, params: Params = {}): string {
 	return template.replace(/\{(\w+)\}/g, (_match, key) => String(params[key] ?? `{${key}}`));
 }
 
-export function t(key: Key, params?: Params): string {
-	const locale = currentLocale as Locale | undefined;
+function coerceLocale(value: unknown): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const locale = value.trim();
+	return locale.length > 0 ? locale : undefined;
+}
+
+function resolveLocale(locale: string | undefined): Locale | undefined {
+	const normalized = locale?.replace("_", "-");
+	if (normalized === "pt-BR" || normalized === "pt-br") {
+		return "pt-BR";
+	}
+	const baseLocale = normalized?.split("-")[0];
+	return baseLocale === "es" || baseLocale === "fr" ? baseLocale : undefined;
+}
+
+function setCurrentLocale(pi: ExtensionAPI, locale: string | undefined): void {
+	if (currentLocale === locale) {
+		return;
+	}
+	currentLocale = locale;
+	pi.events?.emit?.(localeChangedEvent, { locale: currentLocale });
+}
+
+export function t(key: I18nKey, params?: Params): string {
+	const locale = resolveLocale(currentLocale);
 	const template = locale ? translations[locale]?.[key] : undefined;
 	return format(template ?? fallback[key], params);
+}
+
+export function onI18nLocaleChanged(pi: ExtensionAPI, handler: () => void): void {
+	pi.events?.on?.(localeChangedEvent, handler);
 }
 
 export function initI18n(pi: ExtensionAPI): void {
@@ -66,14 +97,15 @@ export function initI18n(pi: ExtensionAPI): void {
 		translations,
 	});
 	pi.events?.on?.("pi-core/i18n/localeChanged", (event: unknown) => {
-		currentLocale = event && typeof event === "object" && "locale" in event
-			? String((event as { locale?: unknown }).locale ?? "")
+		const locale = event && typeof event === "object" && "locale" in event
+			? coerceLocale((event as { locale?: unknown }).locale)
 			: undefined;
+		setCurrentLocale(pi, locale);
 	});
 	pi.events?.emit?.("pi-core/i18n/requestApi", {
 		namespace,
 		onApi(api: { getLocale?: () => string | undefined }) {
-			currentLocale = api.getLocale?.();
+			setCurrentLocale(pi, coerceLocale(api.getLocale?.()));
 		},
 	});
 }
