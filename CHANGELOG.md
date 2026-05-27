@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-05-27
+
+### Added
+
+- Added compact live cumulative session token counts to cmux sidebar progress/final summaries, with optional reported cost via `PI_CMUX_SIDEBAR_COST=1`.
+
+### Changed
+
+- Split cached input out from normal input in sidebar token summaries.
+
+### Fixed
+
+- Count provider-reported token usage/cost from aborted or errored assistant messages in sidebar token totals.
+- Show aborted Pi runs as cancelled/warning in the cmux sidebar instead of red `Pi error`.
+- Stopped leaving persistent `Pi idle` / `Pi done` status pills in the cmux sidebar after runs finish.
+
 ## [0.1.12] - 2026-05-27
 
 ### Added

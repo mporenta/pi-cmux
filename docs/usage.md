@@ -34,9 +34,9 @@ PI_CMUX_NOTIFY_LEVEL=disabled  # off
 `cmux-sidebar` updates the cmux right sidebar while Pi runs. It only activates inside a cmux workspace (`CMUX_WORKSPACE_ID` is present).
 
 It uses:
-- `cmux set-status` for a Pi status pill: idle, running, tool, waiting, done, or error
-- `cmux set-progress` for coarse run progress while Pi is active
-- `cmux log` for run starts, changed files, warnings, and final summaries
+- `cmux set-status` for a temporary Pi status pill while Pi is running, using tools, waiting, done, or errored
+- `cmux set-progress` for coarse run progress and live token counts while Pi is active
+- `cmux log` for run starts, changed files, warnings, final summaries, and compact session token counts, with cached input split out
 - `cmux trigger-flash` when a run finishes and the surface needs attention
 
 Environment settings:
@@ -47,6 +47,9 @@ PI_CMUX_SIDEBAR_FLASH=all            # all | error | disabled
 PI_CMUX_SIDEBAR_LOG_TOOLS=1          # log every tool result
 PI_CMUX_SIDEBAR_LOG_PROMPT=1         # include truncated prompt in start log
 PI_CMUX_SIDEBAR_PROGRESS=0           # disable progress bar updates
+PI_CMUX_SIDEBAR_TOKENS=0             # disable compact live session token counts
+PI_CMUX_SIDEBAR_COST=1               # include reported model cost with tokens
+PI_CMUX_SIDEBAR_FINAL_CLEAR_MS=2500  # clear final status/progress after this delay
 PI_CMUX_SIDEBAR_STATUS_KEY=my-key    # override status key
 ```
 
@@ -204,7 +207,10 @@ PI_CMUX_SIDEBAR_FLASH=all|error|disabled
 PI_CMUX_SIDEBAR_LOG_TOOLS=0|1
 PI_CMUX_SIDEBAR_LOG_PROMPT=0|1
 PI_CMUX_SIDEBAR_PROGRESS=0|1
-PI_CMUX_SIDEBAR_PROGRESS_CLEAR_MS=2500
+PI_CMUX_SIDEBAR_TOKENS=0|1
+PI_CMUX_SIDEBAR_COST=0|1
+PI_CMUX_SIDEBAR_FINAL_CLEAR_MS=2500
+PI_CMUX_SIDEBAR_PROGRESS_CLEAR_MS=2500  # legacy alias for PI_CMUX_SIDEBAR_FINAL_CLEAR_MS
 PI_CMUX_SIDEBAR_STATUS_KEY=<key>
 PI_CMUX_SIDEBAR_STATUS_PRIORITY=80
 PI_CMUX_SIDEBAR_SOURCE=pi

@@ -10,13 +10,14 @@ import {
 import { basename } from "node:path";
 
 const DEFAULT_COMPLETE_THRESHOLD_MS = 15000;
-const DEFAULT_PROGRESS_CLEAR_DELAY_MS = 2500;
+const DEFAULT_FINAL_CLEAR_DELAY_MS = 2500;
 const CMUX_SIDEBAR_TIMEOUT_MS = 1500;
 const MAX_LOG_LENGTH = 240;
 const MAX_PROMPT_LENGTH = 120;
 const DEFAULT_STATUS_PRIORITY = 80;
+const TOKEN_PROGRESS_UPDATE_MIN_MS = 500;
 
-type StatusKind = "idle" | "running" | "tool" | "waiting" | "complete" | "error";
+type StatusKind = "running" | "tool" | "waiting" | "complete" | "cancelled" | "error";
 type LogLevel = "info" | "progress" | "success" | "warning" | "error";
 type FlashLevel = "all" | "error" | "disabled";
 
@@ -33,19 +34,37 @@ interface RunState {
 	firstToolError: string | undefined;
 }
 
+interface TokenUsageLike {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	totalTokens?: number;
+	cost?: number | { total?: number };
+}
+
+interface TokenTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
 interface AssistantMessageLike {
 	role: "assistant";
 	stopReason?: string;
 	errorMessage?: string;
 	content?: string | Array<{ type?: string; text?: string }>;
+	usage?: TokenUsageLike;
 }
 
 const STATUS_STYLE: Record<StatusKind, { icon: string; color: string }> = {
-	idle: { icon: "clock", color: "#8E8E93" },
 	running: { icon: "sparkle", color: "#0A84FF" },
 	tool: { icon: "hammer", color: "#FF9F0A" },
 	waiting: { icon: "clock", color: "#8E8E93" },
 	complete: { icon: "check", color: "#30D158" },
+	cancelled: { icon: "x", color: "#8E8E93" },
 	error: { icon: "x", color: "#FF453A" },
 };
 
@@ -258,18 +277,133 @@ function summarizeAssistantText(message: AssistantMessageLike): string | undefin
 	return text ? truncateText(text, 120) : undefined;
 }
 
-function summarizeRunError(messages: readonly unknown[], fallbackError?: string): string | undefined {
+function summarizeRunFailure(
+	messages: readonly unknown[],
+	fallbackError?: string,
+): { kind: "error" | "cancelled"; summary: string } | undefined {
 	const assistantMessage = getLastAssistantMessage(messages);
-	if (!assistantMessage) return fallbackError;
+	if (!assistantMessage) return fallbackError ? { kind: "error", summary: fallbackError } : undefined;
 	if (assistantMessage.stopReason !== "error" && assistantMessage.stopReason !== "aborted") {
 		return undefined;
 	}
 
-	return assistantMessage.errorMessage?.trim() || summarizeAssistantText(assistantMessage) || fallbackError || "Agent run failed";
+	const summary = assistantMessage.errorMessage?.trim() || summarizeAssistantText(assistantMessage) || fallbackError;
+	if (assistantMessage.stopReason === "aborted") {
+		return { kind: "cancelled", summary: summary || "Operation aborted" };
+	}
+	return { kind: "error", summary: summary || "Agent run failed" };
 }
 
-function buildFinalState(hasRunError: boolean, state: RunState, durationMs: number, thresholdMs: number): "waiting" | "complete" | "error" {
-	if (hasRunError) return "error";
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function createEmptyTokenTotals(): TokenTotals {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+}
+
+function getUsageCostTotal(cost: unknown): number {
+	const direct = finiteNumber(cost);
+	if (direct !== undefined) return direct;
+	if (typeof cost !== "object" || cost === null) return 0;
+	return finiteNumber((cost as { total?: unknown }).total) ?? 0;
+}
+
+function getUsageTokenTotal(usage: TokenUsageLike): number {
+	const totalTokens = finiteNumber(usage.totalTokens) ?? 0;
+	if (totalTokens > 0) return totalTokens;
+	return (
+		(finiteNumber(usage.input) ?? 0) +
+		(finiteNumber(usage.output) ?? 0) +
+		(finiteNumber(usage.cacheRead) ?? 0) +
+		(finiteNumber(usage.cacheWrite) ?? 0)
+	);
+}
+
+function hasReportableUsage(usage?: TokenUsageLike): usage is TokenUsageLike {
+	if (!usage) return false;
+	return getUsageTokenTotal(usage) > 0 || getUsageCostTotal(usage.cost) > 0;
+}
+
+function addTokenUsage(totals: TokenTotals, usage?: TokenUsageLike): void {
+	if (!hasReportableUsage(usage)) return;
+	totals.input += finiteNumber(usage.input) ?? 0;
+	totals.output += finiteNumber(usage.output) ?? 0;
+	totals.cacheRead += finiteNumber(usage.cacheRead) ?? 0;
+	totals.cacheWrite += finiteNumber(usage.cacheWrite) ?? 0;
+	totals.cost += getUsageCostTotal(usage.cost);
+}
+
+function addTokenTotals(left: TokenTotals, right: TokenTotals): TokenTotals {
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		cost: left.cost + right.cost,
+	};
+}
+
+function getSessionTokenTotals(messages: readonly unknown[]): TokenTotals {
+	const totals = createEmptyTokenTotals();
+	for (const message of messages) {
+		if (!isAssistantMessage(message)) continue;
+		addTokenUsage(totals, message.usage);
+	}
+	return totals;
+}
+
+function getBranchTokenTotals(entries: readonly unknown[]): TokenTotals {
+	const totals = createEmptyTokenTotals();
+	for (const entry of entries) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const candidate = entry as { type?: unknown; message?: unknown };
+		if (candidate.type !== "message" || !isAssistantMessage(candidate.message)) continue;
+		addTokenUsage(totals, candidate.message.usage);
+	}
+	return totals;
+}
+
+function trimFixed(value: number, digits: number): string {
+	return value.toFixed(digits).replace(/\.0$/, "");
+}
+
+function formatTokenCount(count: number): string {
+	if (count >= 1_000_000) return `${trimFixed(count / 1_000_000, count >= 10_000_000 ? 0 : 1)}m`;
+	if (count >= 1_000) return `${trimFixed(count / 1_000, count >= 100_000 ? 0 : 1)}k`;
+	return String(Math.round(count));
+}
+
+function formatCost(cost: number): string {
+	if (cost < 0.01) return `$${cost.toFixed(4)}`;
+	if (cost < 1) return `$${cost.toFixed(3)}`;
+	return `$${cost.toFixed(2)}`;
+}
+
+function formatTokenSummary(totals: TokenTotals, includeCost: boolean): string | undefined {
+	const cache = totals.cacheRead + totals.cacheWrite;
+	const hasTokens = totals.input > 0 || cache > 0 || totals.output > 0;
+	const hasCost = includeCost && totals.cost > 0;
+	if (!hasTokens && !hasCost) return undefined;
+
+	const parts: string[] = [];
+	if (hasTokens) {
+		const tokenParts = [`↑${formatTokenCount(totals.input)}`];
+		if (cache > 0) tokenParts.push(`+${formatTokenCount(cache)} cache`);
+		tokenParts.push(`↓${formatTokenCount(totals.output)}`);
+		parts.push(`tok ${tokenParts.join(" ")}`);
+	}
+	if (hasCost) parts.push(formatCost(totals.cost));
+	return parts.join(" · ");
+}
+
+function buildFinalState(
+	failure: { kind: "error" | "cancelled"; summary: string } | undefined,
+	state: RunState,
+	durationMs: number,
+	thresholdMs: number,
+): "waiting" | "complete" | "cancelled" | "error" {
+	if (failure) return failure.kind;
 	if (state.changedFiles.size > 0 || durationMs >= thresholdMs) return "complete";
 	return "waiting";
 }
@@ -318,10 +452,15 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 		getNumberFromEnv("PI_CMUX_NOTIFY_THRESHOLD_MS", DEFAULT_COMPLETE_THRESHOLD_MS),
 	);
 	const progressEnabled = getBooleanFromEnv("PI_CMUX_SIDEBAR_PROGRESS", true);
+	const tokenTrackingEnabled = getBooleanFromEnv("PI_CMUX_SIDEBAR_TOKENS", true);
+	const includeTokenCost = getBooleanFromEnv("PI_CMUX_SIDEBAR_COST", false);
 	const toolLogsEnabled = getBooleanFromEnv("PI_CMUX_SIDEBAR_LOG_TOOLS", false);
 	const includePromptInLog = getBooleanFromEnv("PI_CMUX_SIDEBAR_LOG_PROMPT", false);
 	const flashLevel = getFlashLevelFromEnv();
-	const progressClearDelayMs = getNumberFromEnv("PI_CMUX_SIDEBAR_PROGRESS_CLEAR_MS", DEFAULT_PROGRESS_CLEAR_DELAY_MS);
+	const finalClearDelayMs = getNumberFromEnv(
+		"PI_CMUX_SIDEBAR_FINAL_CLEAR_MS",
+		getNumberFromEnv("PI_CMUX_SIDEBAR_PROGRESS_CLEAR_MS", DEFAULT_FINAL_CLEAR_DELAY_MS),
+	);
 
 	let runState = createEmptyRunState();
 	let pendingPrompt: string | undefined;
@@ -329,7 +468,14 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 	let cmuxUnavailable = false;
 	let flashUnavailable = false;
 	let commandQueue = Promise.resolve();
-	let progressClearTimeout: ReturnType<typeof setTimeout> | undefined;
+	let finalClearTimeout: ReturnType<typeof setTimeout> | undefined;
+	let tokenBaseTotals = createEmptyTokenTotals();
+	let tokenRunTotals = createEmptyTokenTotals();
+	let liveAssistantUsage: TokenUsageLike | undefined;
+	let latestTokenSummary: string | undefined;
+	let currentProgressValue: number | undefined;
+	let currentProgressLabel: string | undefined;
+	let lastTokenProgressUpdateAt = 0;
 
 	const markCmuxUnavailableIfFatal = (text: string): void => {
 		if (isCmuxUnavailableError(text)) {
@@ -387,12 +533,44 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 		enqueueCmux(["log", "--level", level, "--source", source, "--", truncateText(message, MAX_LOG_LENGTH)]);
 	};
 
+	const getCurrentTokenTotals = (): TokenTotals => {
+		const totals = addTokenTotals(tokenBaseTotals, tokenRunTotals);
+		addTokenUsage(totals, liveAssistantUsage);
+		return totals;
+	};
+
+	const updateLatestTokenSummary = (totals: TokenTotals): void => {
+		latestTokenSummary = tokenTrackingEnabled ? formatTokenSummary(totals, includeTokenCost) : undefined;
+	};
+
+	const buildProgressLabel = (label: string): string => {
+		return latestTokenSummary ? `${label} · ${latestTokenSummary}` : label;
+	};
+
+	const refreshProgressLabel = (force = false): void => {
+		if (!progressEnabled || currentProgressValue === undefined || currentProgressLabel === undefined) return;
+		const now = Date.now();
+		if (!force && now - lastTokenProgressUpdateAt < TOKEN_PROGRESS_UPDATE_MIN_MS) return;
+		lastTokenProgressUpdateAt = now;
+		enqueueCmux(["set-progress", progressValue(currentProgressValue), "--label", buildProgressLabel(currentProgressLabel)]);
+	};
+
+	const refreshTokenSummary = (force = false): void => {
+		updateLatestTokenSummary(getCurrentTokenTotals());
+		refreshProgressLabel(force);
+	};
+
 	const setProgress = (value: number, label: string): void => {
+		currentProgressValue = value;
+		currentProgressLabel = label;
 		if (!progressEnabled) return;
-		enqueueCmux(["set-progress", progressValue(value), "--label", label]);
+		lastTokenProgressUpdateAt = Date.now();
+		enqueueCmux(["set-progress", progressValue(value), "--label", buildProgressLabel(label)]);
 	};
 
 	const clearProgress = (): void => {
+		currentProgressValue = undefined;
+		currentProgressLabel = undefined;
 		if (!progressEnabled) return;
 		enqueueCmux(["clear-progress"]);
 	};
@@ -404,39 +582,48 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 		});
 	};
 
-	const cancelProgressClear = (): void => {
-		if (!progressClearTimeout) return;
-		clearTimeout(progressClearTimeout);
-		progressClearTimeout = undefined;
+	const cancelFinalClear = (): void => {
+		if (!finalClearTimeout) return;
+		clearTimeout(finalClearTimeout);
+		finalClearTimeout = undefined;
 	};
 
-	const scheduleProgressClear = (sequence: number): void => {
-		cancelProgressClear();
-		if (!progressEnabled) return;
-		progressClearTimeout = setTimeout(() => {
-			progressClearTimeout = undefined;
+	const scheduleFinalClear = (sequence: number): void => {
+		cancelFinalClear();
+		finalClearTimeout = setTimeout(() => {
+			finalClearTimeout = undefined;
 			if (sequence === runSequence) {
 				clearProgress();
+				clearStatus();
 			}
-		}, progressClearDelayMs);
-		(progressClearTimeout as { unref?: () => void }).unref?.();
+		}, finalClearDelayMs);
+		(finalClearTimeout as { unref?: () => void }).unref?.();
 	};
 
 	pi.on("session_start", async () => {
-		cancelProgressClear();
+		cancelFinalClear();
 		runState = createEmptyRunState();
-		setStatus("idle", "Pi idle");
+		tokenBaseTotals = createEmptyTokenTotals();
+		tokenRunTotals = createEmptyTokenTotals();
+		liveAssistantUsage = undefined;
+		latestTokenSummary = undefined;
+		clearProgress();
+		clearStatus();
 	});
 
 	pi.on("before_agent_start", async (event) => {
 		pendingPrompt = event.prompt ? truncateText(event.prompt, MAX_PROMPT_LENGTH) : undefined;
 	});
 
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_event, ctx) => {
 		runSequence += 1;
-		cancelProgressClear();
+		cancelFinalClear();
 		runState = createEmptyRunState(pendingPrompt);
 		pendingPrompt = undefined;
+		tokenBaseTotals = tokenTrackingEnabled ? getBranchTokenTotals(ctx.sessionManager.getBranch()) : createEmptyTokenTotals();
+		tokenRunTotals = createEmptyTokenTotals();
+		liveAssistantUsage = undefined;
+		updateLatestTokenSummary(tokenBaseTotals);
 		setStatus("running", "Pi running");
 		setProgress(0.08, "Starting");
 		appendLog("progress", includePromptInLog && runState.prompt ? `Started: ${runState.prompt}` : "Run started");
@@ -449,6 +636,19 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 		if (toolLogsEnabled && event.turnIndex > 0) {
 			appendLog("progress", `Turn ${event.turnIndex + 1} started`);
 		}
+	});
+
+	pi.on("message_update", async (event) => {
+		if (!tokenTrackingEnabled || !isAssistantMessage(event.message) || !hasReportableUsage(event.message.usage)) return;
+		liveAssistantUsage = event.message.usage;
+		refreshTokenSummary();
+	});
+
+	pi.on("message_end", async (event) => {
+		if (!tokenTrackingEnabled || !isAssistantMessage(event.message)) return;
+		addTokenUsage(tokenRunTotals, event.message.usage);
+		liveAssistantUsage = undefined;
+		refreshTokenSummary(true);
 	});
 
 	pi.on("tool_execution_start", async (event) => {
@@ -497,33 +697,47 @@ export default function cmuxSidebarExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (event) => {
 		const durationMs = Date.now() - runState.startedAt;
-		const runError = summarizeRunError(event.messages, runState.firstToolError);
-		const finalState = buildFinalState(Boolean(runError), runState, durationMs, thresholdMs);
-		const summary = runError || summarizeSuccess(runState, durationMs, thresholdMs);
+		const failure = summarizeRunFailure(event.messages, runState.firstToolError);
+		const finalState = buildFinalState(failure, runState, durationMs, thresholdMs);
+		const summary = failure?.summary || summarizeSuccess(runState, durationMs, thresholdMs);
+		if (tokenTrackingEnabled) {
+			tokenRunTotals = getSessionTokenTotals(event.messages);
+			liveAssistantUsage = undefined;
+			updateLatestTokenSummary(addTokenTotals(tokenBaseTotals, tokenRunTotals));
+		} else {
+			latestTokenSummary = undefined;
+		}
+		const tokenSummary = latestTokenSummary;
+		const summaryWithUsage = tokenSummary ? `${summary} · ${tokenSummary}` : summary;
 
 		if (finalState === "error") {
 			setStatus("error", "Pi error");
 			setProgress(1, "Error");
-			appendLog("error", summary);
+			appendLog("error", summaryWithUsage);
 			triggerFlash(true);
+		} else if (finalState === "cancelled") {
+			setStatus("cancelled", "Pi cancelled");
+			setProgress(1, "Cancelled");
+			appendLog("warning", summaryWithUsage);
+			triggerFlash(false);
 		} else if (finalState === "complete") {
 			setStatus("complete", "Pi done");
 			setProgress(1, "Done");
-			appendLog("success", summary);
+			appendLog("success", summaryWithUsage);
 			triggerFlash(false);
 		} else {
 			setStatus("waiting", "Pi waiting");
 			setProgress(1, "Waiting");
-			appendLog("info", summary);
+			appendLog("info", summaryWithUsage);
 			triggerFlash(false);
 		}
 
-		scheduleProgressClear(runSequence);
+		scheduleFinalClear(runSequence);
 	});
 
 	pi.on("session_shutdown", async () => {
 		runSequence += 1;
-		cancelProgressClear();
+		cancelFinalClear();
 		clearProgress();
 		clearStatus();
 		await flushCmux();

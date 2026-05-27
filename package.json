@@ -1,6 +1,6 @@
 {
   "name": "pi-cmux",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Pi package with cmux-powered terminal integrations",
   "author": "Javi Molina",
   "license": "MIT",
