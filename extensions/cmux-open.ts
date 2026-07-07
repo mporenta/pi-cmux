@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defineTool } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Type, type Static } from "typebox";
 import {
 	buildContextualTabTitle,
 	buildShellCommand,
@@ -9,10 +11,15 @@ import {
 	openCommandInNewTab,
 	type SplitDirection,
 } from "./cmux-core.ts";
-import { onI18nLocaleChanged, t, type I18nKey } from "./i18n.ts";
 
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const SETTINGS_SECTION_NAME = "pi-cmux";
+// Confirmation timeout for the agent-callable terminal tool. On timeout the
+// dialog auto-declines, so an unattended session never runs an unconfirmed command.
+const OPEN_TERMINAL_CONFIRM_TIMEOUT_MS = 120000;
+// NOTE: Hand-synced with Pi's built-in slash commands plus the commands this
+// package registers. Pi does not expose the reserved-name list at extension
+// load time, so this can drift if Pi adds new built-ins; revisit on Pi upgrades.
 const RESERVED_COMMAND_NAMES = new Set([
 	"login",
 	"logout",
@@ -76,39 +83,33 @@ type TerminalPlacement = SplitDirection | "tab";
 
 type OpenToolContext = Pick<ExtensionContext, "cwd">;
 
-interface CmuxOpenTerminalParams {
-	command: string;
-	placement?: TerminalPlacement;
-	title?: string;
-	focus?: boolean;
-}
-
-const CMUX_OPEN_TERMINAL_PARAMETERS = {
-	type: "object",
-	additionalProperties: false,
-	required: ["command"],
-	properties: {
-		command: {
-			type: "string",
+const CMUX_OPEN_TERMINAL_PARAMETERS = Type.Object(
+	{
+		command: Type.String({
 			description: "Interactive terminal command to run, for example k9s, htop, lazygit, or npm run dev",
-		},
-		placement: {
-			type: "string",
-			enum: ["right", "down", "tab"],
-			default: "tab",
-			description: "Where to open the command. Use tab for a new cmux tab/surface.",
-		},
-		title: {
-			type: "string",
-			description: "Optional cmux tab title. Defaults to the command.",
-		},
-		focus: {
-			type: "boolean",
-			default: true,
-			description: "Whether cmux should focus the new terminal. Defaults to true.",
-		},
+		}),
+		placement: Type.Optional(
+			Type.Union([Type.Literal("right"), Type.Literal("down"), Type.Literal("tab")], {
+				default: "tab",
+				description: "Where to open the command. Use tab for a new cmux tab/surface.",
+			}),
+		),
+		title: Type.Optional(
+			Type.String({
+				description: "Optional cmux tab title. Defaults to the command.",
+			}),
+		),
+		focus: Type.Optional(
+			Type.Boolean({
+				default: true,
+				description: "Whether cmux should focus the new terminal. Defaults to true.",
+			}),
+		),
 	},
-} as const;
+	{ additionalProperties: false },
+);
+
+type CmuxOpenTerminalParams = Static<typeof CMUX_OPEN_TERMINAL_PARAMETERS>;
 
 async function openToolInSplit(
 	pi: ExtensionAPI,
@@ -143,23 +144,23 @@ function registerOpenCommand(
 	pi: ExtensionAPI,
 	name: string,
 	direction: SplitDirection,
-	descriptionKey: I18nKey,
-	successKey: I18nKey,
+	description: string,
+	successMessage: string,
 ): void {
 	pi.registerCommand(name, {
-		description: t(descriptionKey),
+		description,
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (!command) {
-				ctx.ui.notify(t("open.usage", { name }), "warning");
+				ctx.ui.notify(`Usage: /${name} <command...>`, "warning");
 				return;
 			}
 
 			const result = await openToolInSplit(pi, ctx, direction, command);
 			if (result.ok) {
-				ctx.ui.notify(t(successKey), "info");
+				ctx.ui.notify(successMessage, "info");
 			} else {
-				ctx.ui.notify(t("open.failed", { error: result.error }), "error");
+				ctx.ui.notify(`tool split failed: ${result.error}`, "error");
 			}
 		},
 	});
@@ -167,19 +168,19 @@ function registerOpenCommand(
 
 function registerTabOpenCommand(pi: ExtensionAPI, name: string): void {
 	pi.registerCommand(name, {
-		description: t("open.tab.description"),
+		description: "Open a new cmux tab and run any shell command there",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (!command) {
-				ctx.ui.notify(t("open.usage", { name }), "warning");
+				ctx.ui.notify(`Usage: /${name} <command...>`, "warning");
 				return;
 			}
 
 			const result = await openToolInTab(pi, ctx, command, command, true);
 			if (result.ok) {
-				ctx.ui.notify(t("open.success.tab"), "info");
+				ctx.ui.notify("Opened a tool tab", "info");
 			} else {
-				ctx.ui.notify(t("open.failed.tab", { error: result.error }), "error");
+				ctx.ui.notify(`tool tab failed: ${result.error}`, "error");
 			}
 		},
 	});
@@ -377,16 +378,11 @@ function getPlacementLabel(placement: TerminalPlacement): string {
 async function openTerminalCommand(
 	pi: ExtensionAPI,
 	ctx: OpenToolContext,
-	params: CmuxOpenTerminalParams,
+	command: string,
+	placement: TerminalPlacement,
+	title: string,
+	focus: boolean,
 ): Promise<{ ok: true; placement: TerminalPlacement; command: string } | { ok: false; error: string }> {
-	const command = typeof params.command === "string" ? params.command.trim() : "";
-	if (!command) {
-		return { ok: false, error: "Specify a command to open" };
-	}
-
-	const placement = normalizeTerminalPlacement(params.placement);
-	const title = params.title?.trim() || command;
-	const focus = params.focus ?? true;
 	const result = placement === "tab"
 		? await openToolInTab(pi, ctx, command, title, focus)
 		: await openToolInSplit(pi, ctx, placement, command, title, focus);
@@ -399,24 +395,50 @@ async function openTerminalCommand(
 }
 
 function registerAgentTerminalTool(pi: ExtensionAPI): void {
-	pi.registerTool({
+	const tool = defineTool({
 		name: "cmux_open_terminal",
 		label: "Open cmux terminal",
 		description:
-			"Open an interactive terminal command in cmux as a right split, lower split, or new tab/surface. Use for user-requested TUIs, logs, dev servers, watches, or long-running terminal views.",
+			"Open an interactive terminal command in cmux as a right split, lower split, or new tab/surface. Use for user-requested TUIs, logs, dev servers, watches, or long-running terminal views. Runs the command through a login shell in a new cmux surface and requires the user to confirm it interactively.",
 		promptSnippet:
 			"Open an interactive terminal command in cmux when the user asks for a tool or view in another pane, split, tab, or background terminal.",
 		promptGuidelines: [
 			"Use cmux_open_terminal only when the user explicitly asks to open a command in cmux, another pane, split, tab, or background terminal.",
 			"Use cmux_open_terminal with placement='tab' when the user says tab, placement='right' for a side pane, and placement='down' for a below/lower pane.",
 			"Use cmux_open_terminal for interactive TUIs like k9s, lazygit, htop, hunk, log tails, dev servers, or watches; do not use bash for these unless the user wants captured output.",
-			"Do not open terminals proactively with cmux_open_terminal without a user request.",
+			"Do not open terminals proactively with cmux_open_terminal without a user request; the user must confirm each command before it runs.",
 		],
-		parameters: CMUX_OPEN_TERMINAL_PARAMETERS as any,
+		parameters: CMUX_OPEN_TERMINAL_PARAMETERS,
 		executionMode: "sequential",
-		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-			const params = rawParams as CmuxOpenTerminalParams;
-			const result = await openTerminalCommand(pi, ctx, params);
+		async execute(_toolCallId, params: CmuxOpenTerminalParams, signal, _onUpdate, ctx) {
+			const command = typeof params.command === "string" ? params.command.trim() : "";
+			if (!command) {
+				throw new Error("Specify a command to open");
+			}
+
+			const placement = normalizeTerminalPlacement(params.placement);
+			const title = params.title?.trim() || command;
+			const focus = params.focus ?? true;
+
+			// This tool runs an arbitrary command through a login shell, bypassing the
+			// gating that governs the built-in bash tool. Require an interactive
+			// confirmation, and refuse to run when no UI is available to confirm.
+			if (!ctx.hasUI) {
+				throw new Error(
+					"cmux_open_terminal needs an interactive UI to confirm the command, which is unavailable in this mode",
+				);
+			}
+
+			const approved = await ctx.ui.confirm(
+				"Open terminal command in cmux?",
+				`cmux will run this command in a new ${getPlacementLabel(placement)}:\n\n${command}`,
+				{ timeout: OPEN_TERMINAL_CONFIRM_TIMEOUT_MS, signal },
+			);
+			if (!approved) {
+				throw new Error("User declined to open the terminal command");
+			}
+
+			const result = await openTerminalCommand(pi, ctx, command, placement, title, focus);
 			if (!result.ok) {
 				throw new Error(result.error);
 			}
@@ -432,6 +454,8 @@ function registerAgentTerminalTool(pi: ExtensionAPI): void {
 			};
 		},
 	});
+
+	pi.registerTool(tool);
 }
 
 function registerOpenCommands(pi: ExtensionAPI): void {
@@ -439,23 +463,23 @@ function registerOpenCommands(pi: ExtensionAPI): void {
 		pi,
 		"cmo",
 		"right",
-		"open.right.description",
-		"open.success.right",
+		"Open a new right split and run any shell command there",
+		"Opened a tool split to the right",
 	);
 	registerOpenCommand(
 		pi,
 		"cmov",
 		"right",
-		"open.alias.cmo",
-		"open.success.right",
+		"Alias for /cmo",
+		"Opened a tool split to the right",
 	);
 
 	registerOpenCommand(
 		pi,
 		"cmoh",
 		"down",
-		"open.down.description",
-		"open.success.down",
+		"Open a new lower split and run any shell command there",
+		"Opened a tool split below",
 	);
 
 	registerTabOpenCommand(pi, "cmt");
@@ -478,7 +502,4 @@ export default function cmuxOpenExtension(pi: ExtensionAPI) {
 	registerOpenCommands(pi);
 	registerConfiguredSplitCommands(pi);
 	registerAgentTerminalTool(pi);
-	onI18nLocaleChanged(pi, () => {
-		registerOpenCommands(pi);
-	});
 }

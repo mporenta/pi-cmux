@@ -97,6 +97,24 @@ Use `/ck` to open Hunk in a cmux split, add Hunk comments while reviewing, then 
 
 cmux workspace/surface targeting uses `CMUX_WORKSPACE_ID` and `CMUX_SURFACE_ID` automatically. Sidebar integration only activates inside a cmux workspace.
 
+## Security
+
+`pi-cmux` opens real terminals and runs shell commands with your full user permissions in your current working directory. Keep the trust boundary in mind:
+
+- **`cmux_open_terminal` (agent tool).** Pi can call this tool to open a command in a cmux split or tab. It runs the command through a login shell (`sh -lc`) in a new cmux surface, so its output is not captured or gated the way the built-in `bash` tool is. To keep the model from launching commands on its own, every invocation asks you to confirm the exact command before it runs, and the tool refuses to run in non-interactive modes (print/RPC) where no confirmation is possible. Only approve commands you understand.
+- **`/cmo`, `/cmoh`, `/cmt`.** These run whatever shell command you type, in a new split or tab. They are user-initiated, so they are not prompted again.
+- **Pluggable commands (`pi-cmux.commands`).** Entries you configure in `~/.pi/agent/settings.json` or `.pi/settings.json` register `/`-commands that run their configured `run` string. Treat them like shell aliases: only add commands from sources you trust, and remember that project-local `.pi/settings.json` can define them too.
+- **Continuation/worktree commands (`/cmcv`, `/cmch`).** These create git worktrees and start Pi there. They only run `git` and `pi`, but they do write to your filesystem outside the current checkout.
+
+## Troubleshooting
+
+- **"This command must be run from inside a cmux surface"** — Pi is not running inside cmux. Start Pi from a cmux terminal so `cmux identify` can locate the workspace/surface.
+- **`cmux` commands fail or time out** — make sure the `cmux` CLI is installed and on your `PATH`; `pi-cmux` shells out to it for every split, tab, and sidebar update.
+- **Splits/tabs open but exit immediately** — the shell command you passed failed to start. Run it directly in a terminal to see the error; `pi-cmux` only launches it, it does not capture output.
+- **Sidebar status/tokens not updating** — sidebar integration only activates inside a cmux workspace and can be toggled with `PI_CMUX_SIDEBAR` and the related `PI_CMUX_SIDEBAR_*` variables (see Configuration).
+- **No notifications** — check `PI_CMUX_NOTIFY_LEVEL`; setting it to `disabled` turns notifications off, and higher thresholds suppress short-task alerts.
+- **A configured `/`-command did not register** — it was likely skipped for colliding with a reserved/built-in command name or having an invalid `run`/`direction`; start Pi from a terminal to see the `[pi-cmux]` warning explaining why.
+
 ## Bundled resources
 
 Extensions: `cmux-notify`, `cmux-sidebar`, `cmux-split`, `cmux-open`, `cmux-zoxide`, `cmux-review`, `cmux-continue`.

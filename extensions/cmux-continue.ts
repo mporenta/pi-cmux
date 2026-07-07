@@ -281,10 +281,6 @@ function buildWorktreePrompt(branch: string, note?: string): string {
 	});
 }
 
-function buildWorktreeBootstrapPrompt(branch: string, note?: string): string {
-	return buildWorktreePrompt(branch, note);
-}
-
 function appendUserMessage(sessionManager: SessionManager, text: string): void {
 	sessionManager.appendMessage({
 		role: "user",
@@ -379,7 +375,7 @@ async function resolveHandoffTarget(
 		target: {
 			cwd: worktreeResult.path,
 			sessionFile,
-			prompt: buildWorktreeBootstrapPrompt(request.branch, request.note),
+			prompt: buildWorktreePrompt(request.branch, request.note),
 		},
 	};
 }
