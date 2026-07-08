@@ -134,27 +134,6 @@ async function resolveWorktreePath(
 	return { ok: true, path: targetPath, reused: false };
 }
 
-export async function ensureExistingBranchWorktree(
-	pi: ExtensionAPI,
-	repoRoot: string,
-	branch: string,
-): Promise<{ ok: true; path: string; reused: boolean } | { ok: false; error: string }> {
-	if (!(await branchExists(pi, repoRoot, branch))) {
-		return { ok: false, error: `Local branch does not exist: ${branch}` };
-	}
-
-	const pathResult = await resolveWorktreePath(pi, repoRoot, branch);
-	if (!pathResult.ok) return pathResult;
-	if (pathResult.reused) return pathResult;
-
-	const addResult = await execGit(pi, repoRoot, ["worktree", "add", pathResult.path, branch]);
-	if (!addResult.ok) {
-		return { ok: false, error: addResult.error || `Failed to create worktree for branch ${branch}` };
-	}
-
-	return pathResult;
-}
-
 export async function ensureCreatedBranchWorktree(
 	pi: ExtensionAPI,
 	repoRoot: string,

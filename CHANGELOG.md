@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-07-07
+
+### Changed
+
+- `cmux_open_terminal` now requires interactive confirmation before running a command and refuses to run when no interactive UI is available to confirm, matching the gating that governs the built-in `bash` tool.
+- Documented the tool's shell trust boundary in a new README "Security" section and added a "Troubleshooting" section.
+
+### Fixed
+
+- Fixed cmux split/tab targeting that could respawn into the wrong pane when surfaces were created concurrently. New tabs are now matched within the caller's pane and new splits only within a newly created pane, so a live shell is never respawned over.
+
+### Removed
+
+- Removed the inert i18n localization layer. It depended on Pi i18n events that are not part of Pi's public API, so `/cmo`, `/cmov`, and `/cmoh` always fell back to English; those commands now use English directly.
+
 ## [0.1.16] - 2026-05-27
 
 ### Added

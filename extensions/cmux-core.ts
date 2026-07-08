@@ -141,6 +141,24 @@ function collectSurfaceRefs(panes: CmuxPaneInfo[]): Set<string> {
 	return refs;
 }
 
+function paneSurfaceRefs(pane: CmuxPaneInfo): Set<string> {
+	const refs = new Set<string>();
+	if (pane.selected_surface_ref) {
+		refs.add(pane.selected_surface_ref);
+	}
+	for (const surfaceRef of pane.surface_refs ?? []) {
+		refs.add(surfaceRef);
+	}
+	return refs;
+}
+
+function findNewSurfaceInPane(pane: CmuxPaneInfo, previousSurfaceRefs: Set<string>): string | undefined {
+	if (pane.selected_surface_ref && !previousSurfaceRefs.has(pane.selected_surface_ref)) {
+		return pane.selected_surface_ref;
+	}
+	return pane.surface_refs?.find((ref) => !previousSurfaceRefs.has(ref));
+}
+
 async function execCmux(pi: ExtensionAPI, args: string[]): Promise<CmuxExecResult> {
 	const result = await pi.exec("cmux", args, { timeout: CMUX_TIMEOUT_MS });
 	if (result.killed) {
@@ -199,7 +217,12 @@ async function listPanes(pi: ExtensionAPI, workspaceRef: string): Promise<{ ok: 
 	return { ok: true, panes: parsed?.panes ?? [] };
 }
 
-async function waitForNewSurface(pi: ExtensionAPI, workspaceRef: string, previousPanes: CmuxPaneInfo[]): Promise<string | undefined> {
+// A new split creates a brand-new pane, so only accept a surface that lives in a
+// pane that did not exist before AND was not previously seen. Deliberately avoids
+// the old "any unseen surface anywhere" fallback: a surface appearing in a
+// pre-existing pane (or in a pane created by a concurrent split) must never be
+// respawned into, since that would kill a live shell in the wrong pane.
+async function waitForNewSplitSurface(pi: ExtensionAPI, workspaceRef: string, previousPanes: CmuxPaneInfo[]): Promise<string | undefined> {
 	const previousPaneRefs = new Set(previousPanes.map((pane) => pane.ref).filter((ref): ref is string => Boolean(ref)));
 	const previousSurfaceRefs = collectSurfaceRefs(previousPanes);
 
@@ -211,21 +234,42 @@ async function waitForNewSurface(pi: ExtensionAPI, workspaceRef: string, previou
 
 		for (const pane of panesResult.panes) {
 			if (pane.ref && !previousPaneRefs.has(pane.ref)) {
-				if (pane.selected_surface_ref) {
-					return pane.selected_surface_ref;
-				}
-				const firstSurfaceRef = pane.surface_refs?.find((ref) => !previousSurfaceRefs.has(ref));
-				if (firstSurfaceRef) {
-					return firstSurfaceRef;
+				const newSurfaceRef = findNewSurfaceInPane(pane, previousSurfaceRefs);
+				if (newSurfaceRef) {
+					return newSurfaceRef;
 				}
 			}
 		}
 
-		for (const pane of panesResult.panes) {
-			for (const surfaceRef of pane.surface_refs ?? []) {
-				if (!previousSurfaceRefs.has(surfaceRef)) {
-					return surfaceRef;
-				}
+		await delay(SPLIT_READY_DELAY_MS);
+	}
+
+	return undefined;
+}
+
+// A new tab is created inside the caller's existing pane, so scope the search to
+// that pane and only accept a surface that was not already present in it. This
+// avoids matching a surface created concurrently in a different pane.
+async function waitForNewTabSurface(
+	pi: ExtensionAPI,
+	workspaceRef: string,
+	previousPanes: CmuxPaneInfo[],
+	paneRef: string,
+): Promise<string | undefined> {
+	const previousPane = previousPanes.find((pane) => pane.ref === paneRef);
+	const previousSurfaceRefs = previousPane ? paneSurfaceRefs(previousPane) : new Set<string>();
+
+	for (let attempt = 0; attempt < SPLIT_READY_ATTEMPTS; attempt += 1) {
+		const panesResult = await listPanes(pi, workspaceRef);
+		if (!panesResult.ok) {
+			return undefined;
+		}
+
+		const currentPane = panesResult.panes.find((pane) => pane.ref === paneRef);
+		if (currentPane) {
+			const newSurfaceRef = findNewSurfaceInPane(currentPane, previousSurfaceRefs);
+			if (newSurfaceRef) {
+				return newSurfaceRef;
 			}
 		}
 
@@ -313,7 +357,7 @@ export async function openCommandInNewSplit(
 		return { ok: false, error: splitResult.error || "Failed to create cmux split" };
 	}
 
-	const newSurfaceRef = await waitForNewSurface(pi, workspaceRef, beforePanesResult.panes);
+	const newSurfaceRef = await waitForNewSplitSurface(pi, workspaceRef, beforePanesResult.panes);
 	if (!newSurfaceRef) {
 		return { ok: false, error: "Created split, but could not find the new cmux surface" };
 	}
@@ -365,7 +409,7 @@ export async function openCommandInNewTab(
 		return { ok: false, error: newSurfaceResult.error || "Failed to create cmux tab" };
 	}
 
-	const newSurfaceRef = await waitForNewSurface(pi, workspaceRef, beforePanesResult.panes);
+	const newSurfaceRef = await waitForNewTabSurface(pi, workspaceRef, beforePanesResult.panes, paneRef);
 	if (!newSurfaceRef) {
 		return { ok: false, error: "Created tab, but could not find the new cmux surface" };
 	}
