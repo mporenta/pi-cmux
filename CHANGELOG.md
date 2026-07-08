@@ -6,7 +6,7 @@
 
 ### Changed
 
-- `cmux_open_terminal` now requires interactive confirmation before running a command and refuses to run in non-interactive (print/RPC) modes, matching the gating that governs the built-in `bash` tool.
+- `cmux_open_terminal` now requires interactive confirmation before running a command and refuses to run when no interactive UI is available to confirm, matching the gating that governs the built-in `bash` tool.
 - Documented the tool's shell trust boundary in a new README "Security" section and added a "Troubleshooting" section.
 
 ### Fixed

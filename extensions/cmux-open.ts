@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -88,8 +89,11 @@ const CMUX_OPEN_TERMINAL_PARAMETERS = Type.Object(
 		command: Type.String({
 			description: "Interactive terminal command to run, for example k9s, htop, lazygit, or npm run dev",
 		}),
+		// StringEnum emits { type: "string", enum: [...] } rather than a union of
+		// literals, which keeps tool-calling compatible with providers (e.g. Google)
+		// that reject anyOf/const-style enums.
 		placement: Type.Optional(
-			Type.Union([Type.Literal("right"), Type.Literal("down"), Type.Literal("tab")], {
+			StringEnum(["right", "down", "tab"], {
 				default: "tab",
 				description: "Where to open the command. Use tab for a new cmux tab/surface.",
 			}),
